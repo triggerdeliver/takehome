@@ -1,19 +1,100 @@
 import express, { Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
+import { Kafka } from 'kafkajs';
 import { Event } from './types';
 import { initProducer, sendEvent, sendEventsBatch, disconnectProducer } from './producer';
-import { checkRateLimit, getMetrics, resetMetrics } from './redis-client';
+import { checkBothRateLimits, getMetrics, resetMetrics } from './redis-client';
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+const BACKPRESSURE_LAG_THRESHOLD = 5000;
+const RETRY_AFTER_SECONDS = 5;
+
+// Kafka admin for lag checking
+const kafka = new Kafka({
+  clientId: 'event-api-admin',
+  brokers: [process.env.KAFKA_BROKER || 'localhost:9092'],
+});
+const admin = kafka.admin();
+let adminConnected = false;
+
+async function connectAdmin(): Promise<void> {
+  if (!adminConnected) {
+    await admin.connect();
+    adminConnected = true;
+  }
+}
+
+function getClientIp(req: Request): string {
+  // Check x-forwarded-for header first (may contain comma-separated list)
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded) {
+    const ips = typeof forwarded === 'string' ? forwarded : forwarded[0];
+    // Take the first IP in the list (original client)
+    const firstIp = ips.split(',')[0].trim();
+    if (firstIp) return firstIp;
+  }
+  // Fallback to remote address
+  return req.ip || req.socket.remoteAddress || '127.0.0.1';
+}
+
+async function checkKafkaLag(): Promise<{ overThreshold: boolean; lag: number }> {
+  try {
+    await connectAdmin();
+
+    const groupId = 'event-processors';
+    const topic = 'events';
+
+    // Get consumer group offsets
+    const groupOffsets = await admin.fetchOffsets({ groupId, topics: [topic] });
+
+    // Get topic offsets (latest)
+    const topicOffsets = await admin.fetchTopicOffsets(topic);
+
+    let totalLag = 0;
+    for (const partition of topicOffsets) {
+      const groupPartition = groupOffsets.find(
+        (g) => g.topic === topic
+      )?.partitions.find((p) => p.partition === partition.partition);
+
+      const latestOffset = parseInt(partition.high, 10) || 0;
+      const committedOffset = parseInt(groupPartition?.offset || '0', 10);
+
+      if (latestOffset > committedOffset) {
+        totalLag += latestOffset - committedOffset;
+      }
+    }
+
+    return {
+      overThreshold: totalLag > BACKPRESSURE_LAG_THRESHOLD,
+      lag: totalLag,
+    };
+  } catch (error) {
+    // If we can't check lag (e.g., consumer group doesn't exist yet), allow requests
+    console.error('Error checking Kafka lag:', error);
+    return { overThreshold: false, lag: 0 };
+  }
+}
 
 /**
  * POST /events
  */
 app.post('/events', async (req: Request, res: Response) => {
   try {
+    // Check backpressure first
+    const lagCheck = await checkKafkaLag();
+    if (lagCheck.overThreshold) {
+      res.set('Retry-After', RETRY_AFTER_SECONDS.toString());
+      res.status(503).json({
+        error: 'Service temporarily unavailable - backpressure',
+        lag: lagCheck.lag,
+        retryAfter: RETRY_AFTER_SECONDS,
+      });
+      return;
+    }
+
     const { userId, type, payload } = req.body;
 
     if (!userId || !type) {
@@ -29,12 +110,21 @@ app.post('/events', async (req: Request, res: Response) => {
       timestamp: Date.now(),
     };
 
-    const rateLimitResult = await checkRateLimit(userId, event.id);
+    const ip = getClientIp(req);
+    const rateLimitResult = await checkBothRateLimits(userId, ip, event.id);
+
     if (!rateLimitResult.allowed) {
+      // Determine which limit was hit
+      const reason = !rateLimitResult.userResult.allowed ? 'user' : 'ip';
+      const resetAt = !rateLimitResult.userResult.allowed
+        ? rateLimitResult.userResult.resetAt
+        : rateLimitResult.ipResult.resetAt;
+
       res.status(429).json({
         error: 'Rate limit exceeded',
-        remaining: rateLimitResult.remaining,
-        resetAt: rateLimitResult.resetAt,
+        reason,
+        remaining: 0,
+        resetAt,
       });
       return;
     }
@@ -56,6 +146,18 @@ app.post('/events', async (req: Request, res: Response) => {
  */
 app.post('/events/batch', async (req: Request, res: Response) => {
   try {
+    // Check backpressure first
+    const lagCheck = await checkKafkaLag();
+    if (lagCheck.overThreshold) {
+      res.set('Retry-After', RETRY_AFTER_SECONDS.toString());
+      res.status(503).json({
+        error: 'Service temporarily unavailable - backpressure',
+        lag: lagCheck.lag,
+        retryAfter: RETRY_AFTER_SECONDS,
+      });
+      return;
+    }
+
     const { events } = req.body;
 
     if (!Array.isArray(events) || events.length === 0) {
@@ -68,6 +170,7 @@ app.post('/events/batch', async (req: Request, res: Response) => {
       return;
     }
 
+    const ip = getClientIp(req);
     const results: Array<{ eventId: string; status: string }> = new Array(events.length);
     const acceptedEvents: Event[] = [];
 
@@ -93,7 +196,7 @@ app.post('/events/batch', async (req: Request, res: Response) => {
             timestamp: Date.now(),
           };
 
-          const rateLimitResult = await checkRateLimit(userId, event.id);
+          const rateLimitResult = await checkBothRateLimits(userId, ip, event.id);
           if (!rateLimitResult.allowed) {
             results[resultIndex] = { eventId: event.id, status: 'rate_limited' };
             return;
@@ -149,6 +252,19 @@ app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok' });
 });
 
+/**
+ * GET /lag - for debugging
+ */
+app.get('/lag', async (_req: Request, res: Response) => {
+  try {
+    const lagCheck = await checkKafkaLag();
+    res.json(lagCheck);
+  } catch (error) {
+    console.error('Error checking lag:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 async function start(): Promise<void> {
   await initProducer();
 
@@ -159,6 +275,9 @@ async function start(): Promise<void> {
 
 async function shutdown(): Promise<void> {
   console.log('Shutting down API...');
+  if (adminConnected) {
+    await admin.disconnect();
+  }
   await disconnectProducer();
   process.exit(0);
 }

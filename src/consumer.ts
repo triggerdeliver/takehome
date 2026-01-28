@@ -3,7 +3,12 @@ import { Event, ProcessingResult } from './types';
 import {
   tryAcquireEvent,
   saveProcessingResult,
+  addToOrderList,
+  addToDlq,
+  releaseInflight,
+  cleanupAllInflight,
   disconnect as disconnectRedis,
+  redis,
 } from './redis-client';
 
 const kafka = new Kafka({
@@ -14,10 +19,16 @@ const kafka = new Kafka({
 let consumer: Consumer;
 let isShuttingDown = false;
 const inFlightTasks = new Set<Promise<unknown>>();
+const inFlightEventIds = new Set<string>();
+
+// Per-user ordering buffers: userId -> Map<seq, Event>
+const orderBuffers = new Map<string, Map<number, Event>>();
+// Per-user next expected seq
+const nextExpectedSeq = new Map<string, number>();
 
 const CONCURRENCY = parseInt(process.env.CONSUMER_CONCURRENCY || '384', 10);
 const PARTITIONS_CONCURRENCY = parseInt(process.env.CONSUMER_PARTITIONS || '8', 10);
-const MAX_PROCESSING_RETRIES = parseInt(process.env.PROCESSING_RETRIES || '2', 10);
+const MAX_PROCESSING_RETRIES = 3; // 3 attempts total, then DLQ
 const INFLIGHT_RETRY_ATTEMPTS = parseInt(process.env.INFLIGHT_RETRY_ATTEMPTS || '6', 10);
 const INFLIGHT_RETRY_DELAY_MS = parseInt(process.env.INFLIGHT_RETRY_DELAY_MS || '30', 10);
 const PROCESSING_DELAY_MS = parseInt(process.env.PROCESSING_DELAY_MS || '0', 10);
@@ -33,7 +44,12 @@ export async function initConsumer(): Promise<void> {
   console.log('Consumer connected and subscribed');
 }
 
-async function processEvent(_event: Event): Promise<void> {
+async function processEvent(event: Event): Promise<void> {
+  // Check if payload.fail is set - simulate failure
+  if (event.payload?.fail === true) {
+    throw new Error('Simulated failure for DLQ test');
+  }
+
   if (PROCESSING_DELAY_MS > 0) {
     await new Promise((resolve) => setTimeout(resolve, Math.random() * PROCESSING_DELAY_MS));
   }
@@ -61,6 +77,93 @@ async function waitForAcquire(eventId: string): Promise<'acquired' | 'processed'
   return 'inflight';
 }
 
+async function getNextExpectedSeqFromRedis(userId: string): Promise<number> {
+  // Get the current order list from Redis and find the next expected seq
+  const orderList = await redis.lrange(`order:${userId}`, 0, -1);
+  if (orderList.length === 0) {
+    return 1;
+  }
+  const maxSeq = Math.max(...orderList.map(s => parseInt(s, 10)));
+  return maxSeq + 1;
+}
+
+async function tryProcessBufferedEvents(userId: string): Promise<void> {
+  const buffer = orderBuffers.get(userId);
+  if (!buffer || buffer.size === 0) return;
+
+  let nextSeq = nextExpectedSeq.get(userId);
+  if (nextSeq === undefined) {
+    nextSeq = await getNextExpectedSeqFromRedis(userId);
+    nextExpectedSeq.set(userId, nextSeq);
+  }
+
+  while (buffer.has(nextSeq)) {
+    const event = buffer.get(nextSeq)!;
+    buffer.delete(nextSeq);
+
+    // Process this event
+    await processEventWithRetry(event);
+
+    nextSeq += 1;
+    nextExpectedSeq.set(userId, nextSeq);
+  }
+}
+
+async function processEventWithRetry(event: Event): Promise<void> {
+  const seq = event.payload?.seq as number | undefined;
+  let lastError = '';
+
+  for (let attempt = 1; attempt <= MAX_PROCESSING_RETRIES; attempt += 1) {
+    try {
+      await processEvent(event);
+
+      // Success - save result
+      const result: ProcessingResult = {
+        eventId: event.id,
+        status: 'processed',
+        processedAt: Date.now(),
+        attempts: 1,
+        userId: event.userId,
+        type: event.type,
+        seq: seq,
+      };
+      await saveProcessingResult(result);
+
+      // Add to ordering list if seq is present
+      if (seq !== undefined) {
+        await addToOrderList(event.userId, seq);
+      }
+
+      return;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : 'Unknown error';
+
+      if (attempt < MAX_PROCESSING_RETRIES) {
+        await delay(5 * attempt); // Backoff
+        continue;
+      }
+
+      // Max retries exceeded - send to DLQ
+      const failedResult: ProcessingResult = {
+        eventId: event.id,
+        status: 'failed',
+        processedAt: Date.now(),
+        attempts: attempt,
+        userId: event.userId,
+        type: event.type,
+        seq: seq,
+        error: lastError,
+      };
+      await saveProcessingResult(failedResult);
+      await addToDlq(event.id, attempt, lastError);
+
+      // Skip this seq in ordering - next seq should continue
+      // (ordering list will just not include this seq)
+      return;
+    }
+  }
+}
+
 async function handleMessage(
   message: { value: Buffer | null; offset: string },
   resolveOffset: (offset: string) => void
@@ -80,46 +183,65 @@ async function handleMessage(
     return true;
   }
 
-  const acquireStatus = await waitForAcquire(event.id);
-  if (acquireStatus === 'processed') {
-    resolveOffset(message.offset);
-    return true;
-  }
+  // Track inflight event
+  inFlightEventIds.add(event.id);
 
-  if (acquireStatus === 'inflight') {
-    return false;
-  }
-
-  for (let attempt = 0; attempt <= MAX_PROCESSING_RETRIES; attempt += 1) {
-    try {
-      await processEvent(event);
-      const result: ProcessingResult = {
-        eventId: event.id,
-        status: 'processed',
-        processedAt: Date.now(),
-      };
-      await saveProcessingResult(result);
-      resolveOffset(message.offset);
-      return true;
-    } catch (error) {
-      const lastError = error instanceof Error ? error.message : 'Unknown error';
-      if (attempt < MAX_PROCESSING_RETRIES) {
-        await delay(5 * (attempt + 1));
-        continue;
-      }
-      const failedResult: ProcessingResult = {
-        eventId: event.id,
-        status: 'failed',
-        processedAt: Date.now(),
-        error: lastError,
-      };
-      await saveProcessingResult(failedResult);
+  try {
+    const acquireStatus = await waitForAcquire(event.id);
+    if (acquireStatus === 'processed') {
+      // Already processed - skip (idempotency)
       resolveOffset(message.offset);
       return true;
     }
-  }
 
-  return false;
+    if (acquireStatus === 'inflight') {
+      // Still inflight by another worker - don't commit
+      return false;
+    }
+
+    // Check if this event has ordering requirement (seq field)
+    const seq = event.payload?.seq as number | undefined;
+
+    if (seq !== undefined) {
+      // Ordering required - buffer and process in order
+      let buffer = orderBuffers.get(event.userId);
+      if (!buffer) {
+        buffer = new Map();
+        orderBuffers.set(event.userId, buffer);
+      }
+
+      let nextSeq = nextExpectedSeq.get(event.userId);
+      if (nextSeq === undefined) {
+        nextSeq = await getNextExpectedSeqFromRedis(event.userId);
+        nextExpectedSeq.set(event.userId, nextSeq);
+      }
+
+      if (seq === nextSeq) {
+        // Process immediately
+        await processEventWithRetry(event);
+        nextExpectedSeq.set(event.userId, nextSeq + 1);
+
+        // Try to process any buffered events
+        await tryProcessBufferedEvents(event.userId);
+      } else if (seq > nextSeq) {
+        // Out of order - buffer it
+        buffer.set(seq, event);
+        // Release inflight since we're buffering
+        await releaseInflight(event.id);
+      } else {
+        // seq < nextSeq - already processed or duplicate
+        await releaseInflight(event.id);
+      }
+    } else {
+      // No ordering - process immediately
+      await processEventWithRetry(event);
+    }
+
+    resolveOffset(message.offset);
+    return true;
+  } finally {
+    inFlightEventIds.delete(event.id);
+  }
 }
 
 export async function startConsuming(): Promise<void> {
@@ -209,11 +331,28 @@ export async function shutdown(): Promise<void> {
     }
   }
 
+  // Wait for inflight tasks
   if (inFlightTasks.size > 0) {
     await Promise.race([
       Promise.allSettled(Array.from(inFlightTasks)),
       delay(2000),
     ]);
+  }
+
+  // Clean up inflight markers for events we were processing
+  for (const eventId of inFlightEventIds) {
+    try {
+      await releaseInflight(eventId);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  // Clean up any stale inflight keys
+  try {
+    await cleanupAllInflight();
+  } catch (e) {
+    // ignore
   }
 
   if (consumer) {
