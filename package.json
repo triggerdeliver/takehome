@@ -20,7 +20,13 @@
     "test:ordering": "ts-node tests/ordering.test.ts",
     "test:dlq": "ts-node tests/dlq.test.ts",
     "test:multi-consumer": "ts-node tests/multi-consumer.test.ts",
-    "test:backpressure": "ts-node tests/backpressure.test.ts"
+    "test:backpressure": "ts-node tests/backpressure.test.ts",
+    "test:ordering-gap": "ts-node tests/ordering-gap.test.ts",
+    "test:idempotency-key": "ts-node tests/idempotency-key.test.ts",
+    "test:idempotency-key-concurrency": "ts-node tests/idempotency-key-concurrency.test.ts",
+    "test:idempotency-key-mismatch": "ts-node tests/idempotency-key-mismatch.test.ts",
+    "test:validation": "ts-node tests/validation.test.ts",
+    "test:custom": "ts-node tests/custom-runner.test.ts"
   },
   "dependencies": {
     "axios": "^1.6.0",

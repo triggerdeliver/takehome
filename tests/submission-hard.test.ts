@@ -10,11 +10,17 @@ const tests = [
   { name: 'Load Test V2', script: 'test:load' },
   { name: 'Reliability Chaos Test', script: 'test:reliability' },
   { name: 'Ordering Test', script: 'test:ordering' },
+  { name: 'Ordering Gap Timeout Test', script: 'test:ordering-gap' },
   { name: 'DLQ Test', script: 'test:dlq' },
   { name: 'Idempotency Test V2', script: 'test:idempotency' },
+  { name: 'Idempotency Key Test', script: 'test:idempotency-key' },
+  { name: 'Idempotency Key Concurrency Test', script: 'test:idempotency-key-concurrency' },
+  { name: 'Idempotency Key Mismatch Test', script: 'test:idempotency-key-mismatch' },
   { name: 'Rate Limit V2 Test', script: 'test:rate-limit' },
   { name: 'Multi-Consumer Test', script: 'test:multi-consumer' },
   { name: 'Backpressure Test', script: 'test:backpressure' },
+  { name: 'Validation Test', script: 'test:validation' },
+  { name: 'Custom Tests', script: 'test:custom' },
 ];
 
 function runTest(name: string, script: string): TestResult {
@@ -59,7 +65,7 @@ function calculateScore(results: TestResult[]): {
 
 async function runSubmissionTest(): Promise<void> {
   console.log('\n' + '═'.repeat(60));
-  console.log('SUBMISSION TEST - HARD V2.1');
+  console.log('SUBMISSION TEST - HARD V2.3');
   console.log('═'.repeat(60));
   console.log('\nThis will run each test sequentially and verify results.\n');
 
