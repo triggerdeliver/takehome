@@ -59,7 +59,7 @@ takehome/
 ## Requirements
 
 ### 1) Performance (End-to-End)
-- **500,000 events in 30 seconds**
+- **1,000,000 events in 30 seconds**
 - Successfully processed >= 95% by **Redis truth source**
 - Kafka consumer lag returns to **0**
 
